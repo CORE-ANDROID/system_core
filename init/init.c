@@ -39,7 +39,6 @@
 #include <libgen.h>
 
 #include <cutils/list.h>
-#include <cutils/android_reboot.h>
 #include <cutils/sockets.h>
 #include <cutils/iosched_policy.h>
 #include <private/android_filesystem_config.h>
@@ -63,9 +62,17 @@ struct selabel_handle *sehandle;
 struct selabel_handle *sehandle_prop;
 
 static int property_triggers_enabled = 0;
+#ifdef BOARD_USE_MOTOROLA_DEV_ALIAS
+static int device_triggers_enabled = 0;
+#endif
 
 #if BOOTCHART
 static int   bootchart_count;
+#endif
+
+#ifndef BOARD_CHARGING_CMDLINE_NAME
+#define BOARD_CHARGING_CMDLINE_NAME "androidboot.battchg_pause"
+#define BOARD_CHARGING_CMDLINE_VALUE "true"
 #endif
 
 static char console[32];
@@ -73,6 +80,9 @@ static char bootmode[32];
 static char hardware[32];
 static unsigned revision = 0;
 static char qemu[32];
+static char battchg_pause[32];
+
+static int selinux_enabled = 1;
 
 static struct action *cur_action = NULL;
 static struct command *cur_command = NULL;
@@ -89,26 +99,114 @@ void notify_service_state(const char *name, const char *state)
 }
 
 static int have_console;
-static char console_name[PROP_VALUE_MAX] = "/dev/console";
+static char *console_name = "/dev/console";
 static time_t process_needs_restart;
 
 static const char *ENV[32];
+
+static unsigned emmc_boot = 0;
+
+static unsigned charging_mode = 0;
+
+static const char *expand_environment(const char *val)
+{
+    int n;
+    const char *prev_pos = NULL, *copy_pos;
+    size_t len, prev_len = 0, copy_len;
+    char *expanded;
+
+    /* Basic expansion of environment variable; for now
+       we only assume 1 expansion at the start of val
+       and that it is marked as ${var} */
+    if (!val) {
+        return NULL;
+    }
+
+    if ((val[0] == '$') && (val[1] == '{')) {
+        for (n = 0; n < 31; n++) {
+            if (ENV[n]) {
+                len = strcspn(ENV[n], "=");
+                if (!strncmp(&val[2], ENV[n], len)
+                      && (val[2 + len] == '}')) {
+                    /* Matched existing env */
+                    prev_pos = &ENV[n][len + 1];
+                    prev_len = strlen(prev_pos);
+                    break;
+                }
+            }
+        }
+        copy_pos = index(val, '}');
+        if (copy_pos) {
+            copy_pos++;
+            copy_len = strlen(copy_pos);
+        } else {
+            copy_pos = val;
+            copy_len = strlen(val);
+        }
+    } else {
+        copy_pos = val;
+        copy_len = strlen(val);
+    }
+
+    len = prev_len + copy_len + 1;
+    expanded = malloc(len);
+    if (expanded) {
+        if (prev_pos) {
+            snprintf(expanded, len, "%s%s", prev_pos, copy_pos);
+        } else {
+            snprintf(expanded, len, "%s", copy_pos);
+        }
+    }
+
+    /* caller free */
+    return expanded;
+}
 
 /* add_environment - add "key=value" to the current environment */
 int add_environment(const char *key, const char *val)
 {
     int n;
+    const char *expanded;
+
+    expanded = expand_environment(val);
+    if (!expanded) {
+        goto failed;
+    }
 
     for (n = 0; n < 31; n++) {
         if (!ENV[n]) {
-            size_t len = strlen(key) + strlen(val) + 2;
+            size_t len = strlen(key) + strlen(expanded) + 2;
             char *entry = malloc(len);
-            snprintf(entry, len, "%s=%s", key, val);
+            if (!entry) {
+                goto failed_cleanup;
+            }
+            snprintf(entry, len, "%s=%s", key, expanded);
+            free((char *)expanded);
             ENV[n] = entry;
             return 0;
+        } else {
+            char *entry;
+            size_t len = strlen(key);
+            if(!strncmp(ENV[n], key, len) && ENV[n][len] == '=') {
+                len = len + strlen(expanded) + 2;
+                entry = malloc(len);
+                if (!entry) {
+                    goto failed_cleanup;
+                }
+
+                free((char *)ENV[n]);
+                snprintf(entry, len, "%s=%s", key, expanded);
+                free((char *)expanded);
+                ENV[n] = entry;
+                return 0;
+            }
         }
     }
 
+failed_cleanup:
+    free((char *)expanded);
+failed:
+    ERROR("Fail to add env variable: %s. Not enough memory!", key);
     return 1;
 }
 
@@ -436,7 +534,7 @@ static void restart_processes()
 
 static void msg_start(const char *name)
 {
-    struct service *svc = NULL;
+    struct service *svc;
     char *tmp = NULL;
     char *args = NULL;
 
@@ -444,13 +542,11 @@ static void msg_start(const char *name)
         svc = service_find_by_name(name);
     else {
         tmp = strdup(name);
-        if (tmp) {
-            args = strchr(tmp, ':');
-            *args = '\0';
-            args++;
+        args = strchr(tmp, ':');
+        *args = '\0';
+        args++;
 
-            svc = service_find_by_name(tmp);
-        }
+        svc = service_find_by_name(tmp);
     }
 
     if (svc) {
@@ -546,6 +642,16 @@ void execute_one_command(void)
     INFO("command '%s' r=%d\n", cur_command->args[0], ret);
 }
 
+#ifdef BOARD_USE_MOTOROLA_DEV_ALIAS
+void device_changed(const char *name, int is_add)
+{
+    if (device_triggers_enabled) {
+        queue_device_triggers(name, is_add);
+	execute_one_command();
+    }
+}
+#endif
+
 static int wait_for_coldboot_done_action(int nargs, char **args)
 {
     int ret;
@@ -565,9 +671,11 @@ static int keychord_init_action(int nargs, char **args)
 static int console_init_action(int nargs, char **args)
 {
     int fd;
+    char tmp[PROP_VALUE_MAX];
 
     if (console[0]) {
-        snprintf(console_name, sizeof(console_name), "/dev/%s", console);
+        snprintf(tmp, sizeof(tmp), "/dev/%s", console);
+        console_name = strdup(tmp);
     }
 
     fd = open(console_name, O_RDWR);
@@ -575,28 +683,29 @@ static int console_init_action(int nargs, char **args)
         have_console = 1;
     close(fd);
 
-    fd = open("/dev/tty0", O_WRONLY);
-    if (fd >= 0) {
-        const char *msg;
-            msg = "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"  // console is 40 cols x 30 lines
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "             A N D R O I D ";
-        write(fd, msg, strlen(msg));
-        close(fd);
+    if( load_565rle_image(INIT_IMAGE_FILE) ) {
+        fd = open("/dev/tty0", O_WRONLY);
+        if (fd >= 0) {
+            const char *msg;
+                msg = "\n"
+            "\n"
+            "\n"
+            "\n"
+            "\n"
+            "\n"
+            "\n"  // console is 40 cols x 30 lines
+            "\n"
+            "\n"
+            "\n"
+            "\n"
+            "\n"
+            "\n"
+            "\n"
+            "             A N D R O I D ";
+            write(fd, msg, strlen(msg));
+            close(fd);
+        }
     }
-
     return 0;
 }
 
@@ -608,6 +717,10 @@ static void import_kernel_nv(char *name, int for_emulator)
     if (value == 0) return;
     *value++ = 0;
     if (name_len == 0) return;
+
+    if (!strcmp(name,"selinux")) {
+        selinux_enabled = atoi(value);
+    }
 
     if (for_emulator) {
         /* in the emulator, export any kernel option with the
@@ -622,6 +735,14 @@ static void import_kernel_nv(char *name, int for_emulator)
 
     if (!strcmp(name,"qemu")) {
         strlcpy(qemu, value, sizeof(qemu));
+#ifdef WANTS_EMMC_BOOT
+    } else if (!strcmp(name,"androidboot.emmc")) {
+        if (!strcmp(value,"true")) {
+            emmc_boot = 1;
+        }
+#endif
+    } else if (!strcmp(name,BOARD_CHARGING_CMDLINE_NAME)) {
+        strlcpy(battchg_pause, value, sizeof(battchg_pause));
     } else if (!strncmp(name, "androidboot.", 12) && name_len > 12) {
         const char *boot_prop_name = name + 12;
         char prop[PROP_NAME_MAX];
@@ -636,7 +757,7 @@ static void import_kernel_nv(char *name, int for_emulator)
 static void export_kernel_boot_props(void)
 {
     char tmp[PROP_VALUE_MAX];
-    int ret;
+    const char *pval;
     unsigned i;
     struct {
         const char *src_prop;
@@ -650,30 +771,28 @@ static void export_kernel_boot_props(void)
     };
 
     for (i = 0; i < ARRAY_SIZE(prop_map); i++) {
-        ret = property_get(prop_map[i].src_prop, tmp);
-        if (ret > 0)
-            property_set(prop_map[i].dest_prop, tmp);
-        else
-            property_set(prop_map[i].dest_prop, prop_map[i].def_val);
+        pval = property_get(prop_map[i].src_prop);
+        property_set(prop_map[i].dest_prop, pval ?: prop_map[i].def_val);
     }
 
-    ret = property_get("ro.boot.console", tmp);
-    if (ret)
-        strlcpy(console, tmp, sizeof(console));
+    pval = property_get("ro.boot.console");
+    if (pval)
+        strlcpy(console, pval, sizeof(console));
 
     /* save a copy for init's usage during boot */
-    property_get("ro.bootmode", tmp);
-    strlcpy(bootmode, tmp, sizeof(bootmode));
+    strlcpy(bootmode, property_get("ro.bootmode"), sizeof(bootmode));
 
     /* if this was given on kernel command line, override what we read
      * before (e.g. from /proc/cpuinfo), if anything */
-    ret = property_get("ro.boot.hardware", tmp);
-    if (ret)
-        strlcpy(hardware, tmp, sizeof(hardware));
+    pval = property_get("ro.boot.hardware");
+    if (pval)
+        strlcpy(hardware, pval, sizeof(hardware));
     property_set("ro.hardware", hardware);
 
     snprintf(tmp, PROP_VALUE_MAX, "%d", revision);
     property_set("ro.revision", tmp);
+    property_set("ro.emmc",emmc_boot ? "1" : "0");
+    property_set("ro.boot.emmc", emmc_boot ? "1" : "0");
 
     /* TODO: these are obsolete. We should delete them */
     if (!strcmp(bootmode,"factory"))
@@ -789,49 +908,9 @@ void selinux_init_all_handles(void)
     sehandle_prop = selinux_android_prop_context_handle();
 }
 
-static bool selinux_is_disabled(void)
-{
-    char tmp[PROP_VALUE_MAX];
-
-    if (access("/sys/fs/selinux", F_OK) != 0) {
-        /* SELinux is not compiled into the kernel, or has been disabled
-         * via the kernel command line "selinux=0".
-         */
-        return true;
-    }
-
-    if ((property_get("ro.boot.selinux", tmp) != 0) && (strcmp(tmp, "disabled") == 0)) {
-        /* SELinux is compiled into the kernel, but we've been told to disable it. */
-        return true;
-    }
-
-    return false;
-}
-
-static bool selinux_is_enforcing(void)
-{
-    char tmp[PROP_VALUE_MAX];
-
-    if (property_get("ro.boot.selinux", tmp) == 0) {
-        /* Property is not set.  Assume enforcing */
-        return true;
-    }
-
-    if (strcmp(tmp, "permissive") == 0) {
-        /* SELinux is in the kernel, but we've been told to go into permissive mode */
-        return false;
-    }
-
-    if (strcmp(tmp, "enforcing") != 0) {
-        ERROR("SELinux: Unknown value of ro.boot.selinux. Got: \"%s\". Assuming enforcing.\n", tmp);
-    }
-
-    return true;
-}
-
 int selinux_reload_policy(void)
 {
-    if (selinux_is_disabled()) {
+    if (!selinux_enabled) {
         return -1;
     }
 
@@ -857,23 +936,23 @@ int audit_callback(void *data, security_class_t cls, char *buf, size_t len)
     return 0;
 }
 
-static void selinux_initialize(void)
+static int charging_mode_booting(void)
 {
-    if (selinux_is_disabled()) {
-        return;
-    }
+#ifndef BOARD_CHARGING_MODE_BOOTING_LPM
+    return 0;
+#else
+    int f;
+    char cmb;
+    f = open(BOARD_CHARGING_MODE_BOOTING_LPM, O_RDONLY);
+    if (f < 0)
+        return 0;
 
-    INFO("loading selinux policy\n");
-    if (selinux_android_load_policy() < 0) {
-        ERROR("SELinux: Failed to load policy; rebooting into recovery mode\n");
-        android_reboot(ANDROID_RB_RESTART2, 0, "recovery");
-        while (1) { pause(); }  // never reached
-    }
+    if (1 != read(f, (void *)&cmb,1))
+        return 0;
 
-    selinux_init_all_handles();
-    bool is_enforcing = selinux_is_enforcing();
-    INFO("SELinux: security_setenforce(%d)\n", is_enforcing);
-    security_setenforce(is_enforcing);
+    close(f);
+    return ('1' == cmb);
+#endif
 }
 
 int main(int argc, char **argv)
@@ -901,6 +980,11 @@ int main(int argc, char **argv)
          * together in the initramdisk on / and then we'll
          * let the rc file figure out the rest.
          */
+    /* Don't repeat the setup of these filesystems,
+     * it creates double mount points with an unknown effect
+     * on the system.  This init file is for 2nd-init anyway.
+     */
+#ifndef NO_DEVFS_SETUP
     mkdir("/dev", 0755);
     mkdir("/proc", 0755);
     mkdir("/sys", 0755);
@@ -923,6 +1007,7 @@ int main(int argc, char **argv)
          */
     open_devnull_stdio();
     klog_init();
+#endif
     property_init();
 
     get_hardware_name(hardware, &revision);
@@ -936,7 +1021,17 @@ int main(int argc, char **argv)
     cb.func_audit = audit_callback;
     selinux_set_callback(SELINUX_CB_AUDIT, cb);
 
-    selinux_initialize();
+    INFO("loading selinux policy\n");
+    if (selinux_enabled) {
+        if (selinux_android_load_policy() < 0) {
+            selinux_enabled = 0;
+            INFO("SELinux: Disabled due to failed policy load\n");
+        } else {
+            selinux_init_all_handles();
+        }
+    } else {
+        INFO("SELinux:  Disabled by command line option\n");
+    }
     /* These directories were necessarily created before initial policy load
      * and therefore need their security context restored to the proper value.
      * This must happen before /dev is populated by ueventd.
@@ -944,7 +1039,6 @@ int main(int argc, char **argv)
     restorecon("/dev");
     restorecon("/dev/socket");
     restorecon("/dev/__properties__");
-    restorecon_recursive("/sys");
 
     is_charger = !strcmp(bootmode, "charger");
 
@@ -953,7 +1047,23 @@ int main(int argc, char **argv)
         property_load_boot_defaults();
 
     INFO("reading config file\n");
-    init_parse_config_file("/init.rc");
+
+    if (!charging_mode_booting())
+       init_parse_config_file("/init.rc");
+    else
+       init_parse_config_file("/lpm.rc");
+
+    /* Check for an emmc initialisation file and read if present */
+    if (emmc_boot && access("/init.emmc.rc", R_OK) == 0) {
+        INFO("Reading emmc config file");
+            init_parse_config_file("/init.emmc.rc");
+    }
+
+    /* Check for a target specific initialisation file and read if present */
+    if (access("/init.target.rc", R_OK) == 0) {
+        INFO("Reading target specific config file");
+            init_parse_config_file("/init.target.rc");
+    }
 
     action_for_each_trigger("early-init", action_add_queue_tail);
 
@@ -967,7 +1077,11 @@ int main(int argc, char **argv)
     /* skip mounting filesystems in charger mode */
     if (!is_charger) {
         action_for_each_trigger("early-fs", action_add_queue_tail);
-        action_for_each_trigger("fs", action_add_queue_tail);
+        if(emmc_boot) {
+            action_for_each_trigger("emmc-fs", action_add_queue_tail);
+        } else {
+            action_for_each_trigger("fs", action_add_queue_tail);
+        }
         action_for_each_trigger("post-fs", action_add_queue_tail);
         action_for_each_trigger("post-fs-data", action_add_queue_tail);
     }
@@ -976,12 +1090,23 @@ int main(int argc, char **argv)
     queue_builtin_action(signal_init_action, "signal_init");
     queue_builtin_action(check_startup_action, "check_startup");
 
+    /* Older bootloaders use non-standard charging modes. Check for
+     * those now, after mounting the filesystems */
+    if (strcmp(battchg_pause, BOARD_CHARGING_CMDLINE_VALUE) == 0)
+        is_charger = 1;
+
     if (is_charger) {
         action_for_each_trigger("charger", action_add_queue_tail);
     } else {
         action_for_each_trigger("early-boot", action_add_queue_tail);
         action_for_each_trigger("boot", action_add_queue_tail);
     }
+
+#ifdef BOARD_USE_MOTOROLA_DEV_ALIAS
+    queue_all_device_triggers();
+    execute_one_command();
+    device_triggers_enabled = 1;
+#endif
 
         /* run all property triggers based on current state of the properties */
     queue_builtin_action(queue_property_triggers_action, "queue_property_triggers");

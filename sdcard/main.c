@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2013 The Android Open Source Project
+ * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,29 +14,8 @@
  * limitations under the License.
  */
 
-#include "thread_utils.h"
+extern int sdcard_main(int argc, char **argv);
 
-#if defined(__APPLE__)
-
-#include <sys/syscall.h>
-
-// Mac OS >= 10.6 has a system call equivalent to Linux's gettid().
-pid_t gettid() {
-  return syscall(SYS_thread_selfid);
+int main(int argc, char **argv) {
+    return sdcard_main(argc, argv);
 }
-
-#elif !defined(__BIONIC__)
-
-// glibc doesn't implement or export either gettid or tgkill.
-#include <unistd.h>
-#include <sys/syscall.h>
-
-pid_t gettid() {
-  return syscall(__NR_gettid);
-}
-
-int tgkill(int tgid, int tid, int sig) {
-  return syscall(__NR_tgkill, tgid, tid, sig);
-}
-
-#endif

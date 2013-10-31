@@ -579,7 +579,7 @@ static void peerProxyBeforeSelect(SelectableFd* fd) {
 
 /** Prepare to read bytes from the peer. */
 static void peerProxyExpectBytes(PeerProxy* peerProxy, Header* header) {
-    ALOGD("Expecting %zd bytes.", header->size);
+    ALOGD("Expecting %d bytes.", header->size);
 
     peerProxy->inputState = READING_BYTES;
     if (bufferPrepareForRead(peerProxy->inputBuffer, header->size) == -1) {

@@ -33,7 +33,6 @@
 #include <selinux/selinux.h>
 #include <selinux/label.h>
 #include <selinux/android.h>
-#include <selinux/avc.h>
 
 #include <private/android_filesystem_config.h>
 #include <sys/time.h>
@@ -42,6 +41,10 @@
 
 #include <cutils/list.h>
 #include <cutils/uevent.h>
+#ifdef BOARD_USE_MOTOROLA_DEV_ALIAS
+#include <cutils/partition_utils.h>
+#include <sys/poll.h>
+#endif
 
 #include "devices.h"
 #include "util.h"
@@ -67,6 +70,17 @@ struct uevent {
     int major;
     int minor;
 };
+
+#ifdef BOARD_USE_MOTOROLA_DEV_ALIAS
+#define MAX_MMC_PARTITIONS 32
+#define NAME_LEN 32
+#define ALIAS_LEN 32
+#define PATH_LEN 64
+#define BUF_SIZE MAX_MMC_PARTITIONS*128
+
+static void add_mmc_alias(char *dev_name, char *dev_alias);
+static void get_partition_alias_name(char *devname, char *alias);
+#endif
 
 struct perms_ {
     char *name;
@@ -128,7 +142,6 @@ void fixup_sys_perms(const char *upath)
     char buf[512];
     struct listnode *node;
     struct perms_ *dp;
-    char *secontext;
 
         /* upaths omit the "/sys" that paths in this list
          * contain, so we add 4 when comparing...
@@ -150,14 +163,7 @@ void fixup_sys_perms(const char *upath)
         INFO("fixup %s %d %d 0%o\n", buf, dp->uid, dp->gid, dp->perm);
         chown(buf, dp->uid, dp->gid);
         chmod(buf, dp->perm);
-        if (sehandle) {
-            secontext = NULL;
-            selabel_lookup(sehandle, &secontext, buf, 0);
-            if (secontext) {
-                setfilecon(buf, secontext);
-                freecon(secontext);
-           }
-        }
+        restorecon(buf);
     }
 }
 
@@ -367,6 +373,41 @@ static void parse_event(const char *msg, struct uevent *uevent)
                     uevent->firmware, uevent->major, uevent->minor);
 }
 
+static char **get_v4l_device_symlinks(struct uevent *uevent)
+{
+    char **links;
+    int fd = -1;
+    int nr;
+    char link_name_path[256];
+    char link_name[64];
+
+    if (strncmp(uevent->path, "/devices/virtual/video4linux/video", 34))
+        return NULL;
+
+    links = malloc(sizeof(char *) * 2);
+    if (!links)
+        return NULL;
+    memset(links, 0, sizeof(char *) * 2);
+
+    snprintf(link_name_path, sizeof(link_name_path), "%s%s%s",
+            SYSFS_PREFIX, uevent->path, "/link_name");
+    fd = open(link_name_path, O_RDONLY);
+    if (fd < 0)
+        goto err;
+    nr = read(fd, link_name, sizeof(link_name) - 1);
+    close(fd);
+    if (nr <= 0)
+        goto err;
+    link_name[nr] = '\0';
+    if (asprintf(&links[0], "/dev/video/%s", link_name) <= 0)
+        links[0] = NULL;
+
+    return links;
+err:
+    free(links);
+    return NULL;
+}
+
 static char **get_character_device_symlinks(struct uevent *uevent)
 {
     const char *parent;
@@ -452,8 +493,6 @@ static char **parse_platform_block_device(struct uevent *uevent)
     if (uevent->partition_name) {
         p = strdup(uevent->partition_name);
         sanitize(p);
-        if (strcmp(uevent->partition_name, p))
-            NOTICE("Linking partition '%s' as '%s'\n", uevent->partition_name, p);
         if (asprintf(&links[link_num], "%s/by-name/%s", link_path, p) > 0)
             link_num++;
         else
@@ -484,6 +523,9 @@ static void handle_device(const char *action, const char *devpath,
 
     if(!strcmp(action, "add")) {
         make_device(devpath, path, block, major, minor);
+#ifdef BOARD_USE_MOTOROLA_DEV_ALIAS
+	device_changed(devpath, 1);
+#endif
         if (links) {
             for (i = 0; links[i]; i++)
                 make_link(devpath, links[i]);
@@ -491,6 +533,9 @@ static void handle_device(const char *action, const char *devpath,
     }
 
     if(!strcmp(action, "remove")) {
+#ifdef BOARD_USE_MOTOROLA_DEV_ALIAS
+	device_changed(devpath, 0);
+#endif
         if (links) {
             for (i = 0; links[i]; i++)
                 remove_link(devpath, links[i]);
@@ -555,6 +600,21 @@ static void handle_block_device_event(struct uevent *uevent)
 
     handle_device(uevent->action, devpath, uevent->path, 1,
             uevent->major, uevent->minor, links);
+
+#ifdef BOARD_USE_MOTOROLA_DEV_ALIAS
+    /* make Moto specific /dev/block/alias link */
+    if(!strcmp(uevent->action, "add")) {
+        if(!strncmp(uevent->subsystem, "block", 5)) {
+            char dev_alias[ALIAS_LEN]={'\0'};
+            char *basename;
+
+            basename = strrchr(devpath, '/') + 1;
+            get_partition_alias_name(basename, dev_alias);
+            if (strlen(dev_alias))
+                add_mmc_alias(basename, dev_alias);
+        }
+    }
+#endif
 }
 
 static void handle_generic_device_event(struct uevent *uevent)
@@ -639,6 +699,8 @@ static void handle_generic_device_event(struct uevent *uevent)
      } else
          base = "/dev/";
      links = get_character_device_symlinks(uevent);
+     if (!links)
+         links = get_v4l_device_symlinks(uevent);
 
      if (!devpath[0])
          snprintf(devpath, sizeof(devpath), "%s%s", base, name);
@@ -831,15 +893,6 @@ void handle_device_fd()
         struct uevent uevent;
         parse_event(msg, &uevent);
 
-        if (sehandle && selinux_status_updated() > 0) {
-            struct selabel_handle *sehandle2;
-            sehandle2 = selinux_android_file_context_handle();
-            if (sehandle2) {
-                selabel_close(sehandle);
-                sehandle = sehandle2;
-            }
-        }
-
         handle_device_event(&uevent);
         handle_firmware_event(&uevent);
     }
@@ -906,7 +959,6 @@ void device_init(void)
     sehandle = NULL;
     if (is_selinux_enabled() > 0) {
         sehandle = selinux_android_file_context_handle();
-        selinux_status_open(true);
     }
 
     /* is 256K enough? udev uses 16MB! */
@@ -935,3 +987,80 @@ int get_device_fd()
 {
     return device_fd;
 }
+
+#ifdef BOARD_USE_MOTOROLA_DEV_ALIAS
+static void add_mmc_alias(char *dev_name, char *dev_alias)
+{
+    int ret = 0;
+    struct stat buf;
+    char dev_path[PATH_LEN]={'\0'};
+    char dev_link[PATH_LEN]={'\0'};
+    unsigned uid = 0;
+    unsigned gid = 0;
+    mode_t mode = 0;
+
+    if (dev_alias[0] == '\0')
+        return;
+
+    sprintf(dev_path, "/dev/block/%s", dev_name);
+
+    ret = stat(dev_link, &buf);
+    if (!ret)
+        ERROR("The name exist, will not create mmc alias link!\n");
+
+    sprintf(dev_link, "/dev/block/%s", dev_alias);
+
+    mode = get_device_perm(dev_link, &uid, &gid);
+
+    if (!symlink(dev_path, dev_link)) {
+        if (uid != 0 || gid != 0 || mode != 0600) {
+            chown(dev_link, uid, gid);
+            chmod(dev_link, mode | S_IFBLK);
+        }
+    } else if (errno != EEXIST) {
+        ERROR("Create mmc alias link %s->%s error (%s)!\n",
+            dev_path, dev_link, strerror(errno));
+    }
+}
+
+static void get_partition_alias_name(char *devname, char *alias)
+{
+    int fd;
+    char buf[BUF_SIZE];
+    char *data_ptr;
+    char *data_end;
+    ssize_t data_size;
+
+    if (!alias)
+        return;
+
+    fd = open("/proc/partitions", O_RDONLY);
+    if (fd < 0)
+        return;
+
+    buf[sizeof(buf) - 1] = '\0';
+    data_size = read(fd, buf, sizeof(buf) - 1);
+    data_ptr = buf;
+    data_end = buf + data_size;
+    *data_end = '\0';
+    while (data_ptr < data_end) {
+        int dev_major, dev_minor;
+        unsigned long long blocks_num;
+        char dev_name[NAME_LEN]={'\0'};
+        char dev_alias[ALIAS_LEN]={'\0'};
+
+        int r = sscanf(data_ptr, "%4d  %7d %10llu %31s%*['\t']%31[^'\n']\n",
+                   &dev_major, &dev_minor, &blocks_num, dev_name, dev_alias);
+
+        if (r == 5 && !strncmp(dev_name, devname, NAME_LEN)) {
+            strncpy(alias, dev_alias, ALIAS_LEN);
+            break;
+        }
+
+        /* Advance cursor to next line */
+        while (data_ptr < data_end && *data_ptr != '\n') data_ptr++;
+        while (data_ptr < data_end && *data_ptr == '\n') data_ptr++;
+    }
+    close(fd);
+}
+#endif
